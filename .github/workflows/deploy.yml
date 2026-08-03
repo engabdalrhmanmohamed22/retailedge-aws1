@@ -22,7 +22,7 @@ permissions:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: retailedge-app
-  ACCOUNT_ID: "123456789012"  # <-- replace with your real AWS account ID
+  ACCOUNT_ID: "026249143418"  # <-- replace with your real AWS account ID
 
 jobs:
   # ---------------------------------------------------------------------
