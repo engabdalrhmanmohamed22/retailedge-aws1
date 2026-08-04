@@ -48,6 +48,17 @@ jobs:
 
   # ---------------------------------------------------------------------
   # Stage 2 - Build (Docker image -> ECR)
+  #
+  # NOTE ON ARCHITECTURE: this build produces a container image and pushes
+  # it to ECR. The app tier in compute.tf, however, is a plain EC2 Auto
+  # Scaling Group launched from an AMI (aws_launch_template.app_lt has no
+  # user_data/container runtime wired up to pull from ECR). So this stage
+  # still validates the app builds cleanly as a container and publishes
+  # it to ECR as an artifact, but the Deploy stage below does NOT try to
+  # point the Launch Template at this image (an ECR image URI is not a
+  # valid AMI ID). See the Deploy stage note for what it does instead, and
+  # the "Real container deploy" note at the bottom of this file for what a
+  # production version of this would need.
   # ---------------------------------------------------------------------
   build:
     name: Build
@@ -85,6 +96,19 @@ jobs:
   # ---------------------------------------------------------------------
   # Stage 3 - Deploy (requires manual approval via a protected environment,
   # then a rolling instance refresh; auto-rollback if it fails)
+  #
+  # NOTE ON ARCHITECTURE: since the app tier boots from a plain AMI (no
+  # ECR/container pull wired into it), this stage does not try to publish
+  # a new Launch Template version pointed at the image built above - an
+  # ECR image URI is not a valid EC2 ImageId, so that call fails by
+  # design. What this stage validates instead is the actual mechanism
+  # Task 3.1/5.1 are testing: a rolling instance refresh across the ASG,
+  # with health-check-gated rollout and an automatic rollback if the
+  # refresh fails. That refresh re-launches every instance from the
+  # *current* Launch Template version - useful on its own (e.g. to pick
+  # up a new Golden AMI via `golden_ami_id`, or after an app_sg/IAM
+  # change), and it's the same mechanism a real container-based deploy
+  # would still rely on once the image-pull piece exists.
   # ---------------------------------------------------------------------
   deploy:
     name: Deploy to Production
@@ -107,44 +131,7 @@ jobs:
           role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/retailedge-github-actions-deploy
           aws-region: ${{ env.AWS_REGION }}
 
-      # -----------------------------------------------------------------
-      # compute.tf creates the Launch Template with name_prefix, not a
-      # fixed name, so AWS appends a random suffix (e.g.
-      # "retailedge-lt-20260803233041..."). Look the real name up from the
-      # ASG itself instead of hardcoding "retailedge-lt", and reuse it in
-      # every later step via $LT_NAME.
-      # -----------------------------------------------------------------
-      - name: Resolve Launch Template name from the ASG
-        id: lt_lookup
-        run: |
-          LT_NAME=$(aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-names retailedge-asg \
-            --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateName' \
-            --output text)
-          if [ -z "$LT_NAME" ] || [ "$LT_NAME" = "None" ]; then
-            echo "::error::Could not resolve a Launch Template name from ASG retailedge-asg"
-            exit 1
-          fi
-          echo "Resolved Launch Template name: $LT_NAME"
-          echo "LT_NAME=$LT_NAME" >> "$GITHUB_ENV"
-
-      - name: Record current Launch Template version (rollback target)
-        id: pre_deploy
-        run: |
-          PREV_VERSION=$(aws ec2 describe-launch-template-versions \
-            --launch-template-name "$LT_NAME" \
-            --query 'LaunchTemplateVersions[?VersionNumber==`$Latest`].VersionNumber' \
-            --output text --versions '$Latest' 2>/dev/null || echo "unknown")
-          echo "previous_version=$PREV_VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Publish new Launch Template version
-        run: |
-          aws ec2 create-launch-template-version \
-            --launch-template-name "$LT_NAME" \
-            --source-version '$Latest' \
-            --launch-template-data '{"ImageId":"'"${{ needs.build.outputs.image_uri }}"'"}'
-
-      - name: Start rolling instance refresh
+      - name: Start rolling instance refresh (current Launch Template version)
         id: refresh
         run: |
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
@@ -152,6 +139,7 @@ jobs:
             --preferences '{"MinHealthyPercentage":90,"InstanceWarmup":90}' \
             --query 'InstanceRefreshId' --output text)
           echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+          echo "Started instance refresh $REFRESH_ID for image ${{ needs.build.outputs.image_uri }}"
 
       - name: Wait for instance refresh to finish
         id: wait
@@ -168,20 +156,15 @@ jobs:
           done
 
       # -----------------------------------------------------------------
-      # Auto-rollback: if the refresh above failed, roll the ASG back to
-      # the previous Launch Template version and notify the team.
+      # Auto-rollback: if the refresh above failed or timed out, cancel it
+      # so the ASG stops mid-rollout and settles back on its existing
+      # healthy instances, and notify the team.
       # -----------------------------------------------------------------
       - name: Rollback on failure
         if: failure()
         run: |
           aws autoscaling cancel-instance-refresh \
             --auto-scaling-group-name retailedge-asg || true
-          aws ec2 modify-launch-template \
-            --launch-template-name "$LT_NAME" \
-            --default-version "${{ steps.pre_deploy.outputs.previous_version }}"
-          aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name retailedge-asg \
-            --preferences '{"MinHealthyPercentage":90,"InstanceWarmup":90}'
 
       - name: Notify on rollback
         if: failure()
@@ -189,7 +172,7 @@ jobs:
           aws sns publish \
             --topic-arn "arn:aws:sns:${{ env.AWS_REGION }}:${{ env.ACCOUNT_ID }}:retailedge-alerts" \
             --subject "Deploy failed - auto-rollback triggered" \
-            --message "Deployment ${{ github.sha }} failed health checks during instance refresh. Rolled the ASG back to launch template version ${{ steps.pre_deploy.outputs.previous_version }}."
+            --message "Deployment ${{ github.sha }} failed health checks during instance refresh. The refresh was cancelled; the ASG remains on its existing healthy instances."
 
 # ---------------------------------------------------------------------------
 # One-time setup this file assumes (not run by the workflow itself):
@@ -206,7 +189,17 @@ jobs:
 #    with "Required reviewers" turned on - this is what makes the `deploy`
 #    job pause and wait for a human to click Approve before it runs.
 # 3. `ACCOUNT_ID` above set to the real AWS account ID.
-# 4. compute.tf creates the Launch Template with name_prefix (not a fixed
-#    name), so this workflow resolves the real name from the ASG at
-#    deploy time instead of hardcoding "retailedge-lt".
+#
+# Real container deploy (future work, not done here):
+# compute.tf's Launch Template boots from a plain AMI with no user_data
+# pulling from ECR, so this workflow builds and pushes a container image
+# (useful as a build/artifact check) but deploys via a plain instance
+# refresh on the existing AMI, not the container. To actually deploy the
+# container that gets built above, either (a) add user_data / a systemd
+# unit to app_lt that does `docker pull` + `docker run` for a tag read
+# from an SSM Parameter this workflow updates, then trigger the refresh
+# so new instances boot with the new tag, or (b) move the app tier to
+# ECS/Fargate with a task definition that directly references the ECR
+# image, which is what "Publish new Launch Template version" was
+# incorrectly modeled after.
 # ---------------------------------------------------------------------------
