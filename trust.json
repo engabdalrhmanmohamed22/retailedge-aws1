@@ -12,7 +12,7 @@
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
         },
         "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:engabdahirmamohamed22/retailedge-aws1:*"
+          "token.actions.githubusercontent.com:sub": "repo:engabdalrhmanmohamed22@237357933/retailedge-aws1@1321003315:*"
         }
       }
     }
