@@ -24,6 +24,26 @@ resource "aws_launch_template" "app_lt" {
   instance_type = var.instance_type
   key_name      = var.key_name # null = no key pair; use SSM Session Manager instead (IAM role below)
 
+  # ---------------------------------------------------------------------
+  # Minimal user_data so the instance actually answers the ALB target
+  # group's health check (port 8080, path /health) instead of booting a
+  # bare AMI with nothing listening - without this, ELB health checks
+  # never pass and instance_refresh in the CI/CD pipeline hangs forever
+  # waiting for MinHealthyPercentage. This is placeholder content, not
+  # the real PHP app - swap for a proper deploy mechanism (Golden AMI or
+  # container pull) before production use.
+  # ---------------------------------------------------------------------
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    dnf install -y httpd || yum install -y httpd
+    sed -i 's/Listen 80/Listen 8080/' /etc/httpd/conf/httpd.conf
+    echo "OK" > /var/www/html/health
+    echo "<h1>RetailEdge - placeholder page</h1>" > /var/www/html/index.html
+    systemctl enable httpd
+    systemctl restart httpd
+    EOF
+  )
+
   vpc_security_group_ids = [aws_security_group.app_sg.id]
 
   iam_instance_profile {
